@@ -1,0 +1,17 @@
+
+# Project Writeup: Cross-Species Single-Cell Analysis with Seurat & SingleCellExperiment
+
+## Objective
+This project compares two pipelines for integrating and analyzing human and mouse single-cell RNA-seq data:
+1. Seurat-based pipeline
+2. SingleCellExperiment (SCE)-based pipeline
+
+We perform preprocessing, annotation, gene harmonization, and dimensionality reduction in both frameworks.
+
+## Summary
+- Harmonized mouse-human gene names
+- Integrated UMAP analysis
+- Manual cluster annotation on human cells
+- DE-ready object outputs
+
+See README.txt for how to reproduce our experiments.
