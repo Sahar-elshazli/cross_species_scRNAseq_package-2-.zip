@@ -1,0 +1,97 @@
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(tidyverse)
+  library(patchwork)
+  library(Matrix)
+  library(data.table)
+  library(biomaRt)
+})
+
+human_exon_path <- "human_exon.csv"
+human_intron_path <- "human_intron.csv"
+human_metadata_path <- "human_metadata.csv"
+human_gene_info_path <- "human_gene_info.csv"
+mouse_exon_path <- "mouse_exon.csv"
+mouse_intron_path <- "mouse_intron.csv"
+mouse_metadata_path <- "mouse_metadata.csv"
+
+
+initial_sample_size <- 2000
+variable_features_count <- 10000
+pca_dimensions <- 1:10
+human_mito_pattern <- "^MT-"
+mouse_mito_column <- "percent_mt_exon_reads"
+
+downsample_data <- function(species, exon_file, intron_file, metadata_file, metadata_id_col, project_name, mito_col = NULL) {
+  exon <- fread(exon_file, data.table = FALSE)
+  intron <- fread(intron_file, data.table = FALSE)
+  metadata <- read.csv(metadata_file, stringsAsFactors = FALSE)
+  
+  rownames(exon) <- exon[[1]]; exon <- exon[, -1]
+  rownames(intron) <- intron[[1]]; intron <- intron[, -1]
+  rownames(metadata) <- metadata[[metadata_id_col]]
+  
+  common_genes <- intersect(rownames(exon), rownames(intron))
+  common_cells <- intersect(colnames(exon), colnames(intron))
+  
+  cells_to_use <- intersect(common_cells, rownames(metadata))
+  sampled_cells <- if (length(cells_to_use) > initial_sample_size) sample(cells_to_use, initial_sample_size) else cells_to_use
+  
+  counts <- exon[common_genes, sampled_cells] + intron[common_genes, sampled_cells]
+  meta <- metadata[sampled_cells, ]
+  
+  if (!is.null(mito_col) && mito_col %in% colnames(meta)) {
+    meta$percent.mt <- meta[[mito_col]]
+  }
+  
+  seurat_obj <- CreateSeuratObject(counts = as.matrix(counts), meta.data = meta, project = project_name)
+  seurat_obj$species <- species
+  return(seurat_obj)
+}
+
+human_obj <- downsample_data("Human", human_exon_path, human_intron_path, human_metadata_path, "seq_name", "HumanVISp")
+human_genes <- read.csv(human_gene_info_path, stringsAsFactors = FALSE)
+mouse_obj <- downsample_data("Mouse", mouse_exon_path, mouse_intron_path, mouse_metadata_path, "sample_name", "MouseVISp", mito_col = mouse_mito_column)
+
+mouse_entrez_ids <- rownames(mouse_obj)
+mouse_mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+mouse_symbols <- getBM(attributes = c("entrezgene_id", "mgi_symbol"), filters = "entrezgene_id", values = mouse_entrez_ids, mart = mouse_mart)
+mouse_symbols <- mouse_symbols[!duplicated(mouse_symbols$entrezgene_id), ]
+rownames(mouse_obj) <- make.unique(mouse_symbols$mgi_symbol[match(rownames(mouse_obj), mouse_symbols$entrezgene_id)])
+
+gene_map <- human_genes %>% filter(gene != "" & mouse_homologenes != "") %>% 
+  select(human_symbol = gene, mouse_symbol = mouse_homologenes) %>% 
+  distinct()
+
+mouse_rename <- setNames(gene_map$human_symbol, toupper(gene_map$mouse_symbol))
+rownames(mouse_obj) <- ifelse(toupper(rownames(mouse_obj)) %in% names(mouse_rename), 
+                              mouse_rename[toupper(rownames(mouse_obj))], 
+                              rownames(mouse_obj))
+
+common_genes <- intersect(rownames(human_obj), rownames(mouse_obj))
+human_obj <- human_obj[common_genes, ]
+mouse_obj <- mouse_obj[common_genes, ]
+
+human_obj[["percent.mt"]] <- PercentageFeatureSet(human_obj, pattern = human_mito_pattern)
+human_obj <- NormalizeData(human_obj) %>% FindVariableFeatures(nfeatures = variable_features_count) %>% 
+  ScaleData() %>% RunPCA(npcs = length(pca_dimensions)) %>% RunUMAP(dims = pca_dimensions)
+
+human_pre <- human_obj
+mouse_pre <- NormalizeData(mouse_obj) %>% FindVariableFeatures(nfeatures = variable_features_count) %>% 
+  ScaleData() %>% RunPCA(npcs = length(pca_dimensions))
+
+features_to_integrate <- SelectIntegrationFeatures(list(human_pre, mouse_pre), nfeatures = variable_features_count)
+integration_anchors <- FindIntegrationAnchors(list(human_pre, mouse_pre), anchor.features = features_to_integrate, reduction = "rpca")
+integrated_obj <- IntegrateData(anchorset = integration_anchors)
+
+human_counts <- GetAssayData(human_pre, assay = "RNA", slot = "counts")
+mouse_counts <- GetAssayData(mouse_pre, assay = "RNA", slot = "counts")
+combined_counts <- cbind(human_counts[, colnames(integrated_obj)[integrated_obj$species == "Human"]],
+                         mouse_counts[, colnames(integrated_obj)[integrated_obj$species == "Mouse"]])
+integrated_obj[["RNA"]] <- CreateAssayObject(counts = combined_counts)
+integrated_obj <- NormalizeData(integrated_obj, assay = "RNA")
+
+integrated_obj <- ScaleData(integrated_obj) %>% RunPCA(npcs = length(pca_dimensions)) %>% RunUMAP(dims = pca_dimensions)
+
+DimPlot(integrated_obj, reduction = "umap", group.by = "species") + ggtitle("Species Composition")
