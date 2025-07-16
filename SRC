@@ -1,0 +1,116 @@
+
+suppressPackageStartupMessages({
+  library(SingleCellExperiment)
+  library(scater)
+  library(scran)
+  library(tidyverse)
+  library(Matrix)
+  library(data.table)
+  library(biomaRt)
+})
+
+
+human_exon_path <- "human_exon.csv"
+human_intron_path <- "human_intron.csv"
+human_meta_path <- "human_metadata.csv"
+human_gene_info_path <- "human_gene_info.csv"
+mouse_exon_path <- "mouse_exon.csv"
+mouse_intron_path <- "mouse_intron.csv"
+mouse_meta_path <- "mouse_metadata.csv"
+
+sample_size <- 2000
+mito_col_mouse <- "percent_mt_exon_reads"
+mt_pattern_human <- "^MT-"
+
+downsample_sce <- function(species, exon_file, intron_file, meta_file, id_col, mito_col = NULL) {
+  exon <- fread(exon_file, data.table = FALSE)
+  intron <- fread(intron_file, data.table = FALSE)
+  meta <- read.csv(meta_file, stringsAsFactors = FALSE)
+  
+  rownames(exon) <- exon[[1]]; exon <- exon[, -1]
+  rownames(intron) <- intron[[1]]; intron <- intron[, -1]
+  rownames(meta) <- meta[[id_col]]
+  
+  common_genes <- intersect(rownames(exon), rownames(intron))
+  common_cells <- intersect(colnames(exon), colnames(intron))
+  valid_cells <- intersect(common_cells, rownames(meta))
+  
+  sampled <- if (length(valid_cells) > sample_size) sample(valid_cells, sample_size) else valid_cells
+  
+  counts <- exon[common_genes, sampled] + intron[common_genes, sampled]
+  col_data <- meta[sampled, ]
+  
+  if (!is.null(mito_col) && mito_col %in% colnames(col_data)) {
+    col_data$percent_mt <- col_data[[mito_col]]
+  }
+  
+  sce <- SingleCellExperiment(assays = list(counts = as.matrix(counts)), colData = col_data)
+  sce$species <- species
+  return(sce)
+}
+
+human_sce <- downsample_sce("Human", human_exon_path, human_intron_path, human_meta_path, "seq_name")
+human_genes <- read.csv(human_gene_info_path, stringsAsFactors = FALSE)
+mouse_sce <- downsample_sce("Mouse", mouse_exon_path, mouse_intron_path, mouse_meta_path, "sample_name", mito_col = mito_col_mouse)
+
+human_sce <- logNormCounts(human_sce)
+human_sce <- runPCA(human_sce, ncomponents = 10)
+human_sce <- runUMAP(human_sce, dimred = "PCA")
+
+mouse_sce <- logNormCounts(mouse_sce)
+mouse_sce <- runPCA(mouse_sce, ncomponents = 10)
+
+mouse_ids <- rownames(mouse_sce)
+mouse_mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+mgi_map <- getBM(attributes = c("entrezgene_id", "mgi_symbol"), 
+                 filters = "entrezgene_id", values = mouse_ids, mart = mouse_mart)
+mgi_map <- mgi_map[!duplicated(mgi_map$entrezgene_id), ]
+
+rownames(mouse_sce) <- make.unique(mgi_map$mgi_symbol[match(rownames(mouse_sce), mgi_map$entrezgene_id)])
+
+gene_map <- human_genes %>% filter(gene != "" & mouse_homologenes != "") %>% 
+  select(human_symbol = gene, mouse_symbol = mouse_homologenes) %>% 
+  distinct()
+rename_map <- setNames(gene_map$human_symbol, toupper(gene_map$mouse_symbol))
+
+rownames(mouse_sce) <- ifelse(toupper(rownames(mouse_sce)) %in% names(rename_map), 
+                              rename_map[toupper(rownames(mouse_sce))], 
+                              rownames(mouse_sce))
+
+common_genes <- intersect(rownames(human_sce), rownames(mouse_sce))
+human_sce <- human_sce[common_genes, ]
+mouse_sce <- mouse_sce[common_genes, ]
+
+combined_counts <- cbind(counts(human_sce), counts(mouse_sce))
+combined_coldata <- rbind(colData(human_sce), colData(mouse_sce))
+
+combined_sce <- SingleCellExperiment(assays = list(counts = combined_counts), colData = combined_coldata)
+combined_sce <- logNormCounts(combined_sce)
+combined_sce <- runPCA(combined_sce, ncomponents = 10)
+combined_sce <- runUMAP(combined_sce, dimred = "PCA")
+
+human_clusters <- colLabels(human_sce, on = "UMAP")
+man_anno_map <- c(
+  "0" = "Exc_Cluster0",
+  "1" = "L6b/CT_Exc",
+  "2" = "Astro",
+  "3" = "Oligo",
+  "4" = "Microglia_siglech",
+  "5" = "L23/4_IT_Exc",
+  "6" = "Micro",
+  "7" = "Low_quality_astro",
+  "8" = "Inh_PVALB",
+  "9" = "OPC",
+  "10" = "Inh_LAMP5",
+  "11" = "Inh_VIP",
+  "12" = "Inh_RELN",
+  "13" = "Inh_CCK",
+  "14" = "Inh_CALB2",
+  "15" = "L4_IT_Exc"
+)
+
+
+de_novo_labels <- as.character(human_clusters)
+human_sce$manual_annotation <- man_anno_map[de_novo_labels]
+
+plotUMAP(combined_sce, colour_by = "species")
